@@ -1,0 +1,57 @@
+# owner of the db permission :
+        ALTER TABLE machine_events OWNER TO machinemon;
+        ALTER SEQUENCE machine_events_id_seq OWNER TO machinemon;
+
+
+
+# Create new table with column Schema : 
+
+                    DROP TABLE IF EXISTS machine_events;
+
+                    CREATE TABLE machine_events (
+                        id SERIAL PRIMARY KEY,
+                        timestamp TIMESTAMP NOT NULL,
+                        machine_id INT NOT NULL,
+                        power_status BOOLEAN NOT NULL,
+                        downtime_status BOOLEAN NOT NULL,
+                        duration_minutes INT,
+                        machine_status_on_time INT,
+                        machine_status_off_time INT,
+                        downtime_status_time INT
+                    );
+
+# AVOID duplicates, prev rows will not be adding again
+SQL >
+        ALTER TABLE machine_events
+        ADD CONSTRAINT uniq_machine_timestamp UNIQUE (machine_id, timestamp);
+
+
+
+# TASK Scheduler points
+
+1 - Click Win + R ->  input this "taskschd.msc"
+
+
+
+/////////////////////////////////////////////////////////////////// Latest one again //////////////////////////////////////////////////////////////
+
+
+
+#1 install python first:
+        python --version
+
+
+
+2# cd C:\data_record:
+        python -m venv venv
+
+
+3# cd C:\data_record:
+        venv\Scripts\activate
+
+4# pip list :
+        pip install pyodbc python-dotenv "python-socketio[client]" requests
+        python collector.py
+
+When you’re done working and want to deactivate it, just type:
+        deactivate

@@ -1,0 +1,15 @@
+# Ignore database
+DataRecord.accdb
+DataRecord.accdb/
+.DataRecord.accdb/
+
+# Ignore virtual environments
+.venv/
+venv/
+
+# Common extras (recommended)
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
