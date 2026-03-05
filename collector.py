@@ -13,36 +13,34 @@ from supabase import create_client, Client
 # ─────────────────────────────────────────────
 load_dotenv()
 
-DB_PATH          = os.getenv("DB_PATH")
-SUPABASE_URL     = os.getenv("SUPABASE_URL")
-SUPABASE_KEY     = os.getenv("SUPABASE_SERVICE_KEY")
-POLL_INTERVAL    = float(os.getenv("POLL_INTERVAL", 60))
+DB_PATH       = os.getenv("DB_PATH")
+SUPABASE_URL  = os.getenv("SUPABASE_URL")
+SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY")
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", 60))
 
-PKT_OFFSET       = timedelta(hours=5)
+PKT_OFFSET = timedelta(hours=5)
 
 # Performance / observability
 FETCH_BATCH_SIZE         = int(os.getenv("FETCH_BATCH_SIZE", "5000"))
-SUPABASE_BATCH_SIZE      = int(os.getenv("SUPABASE_BATCH_SIZE", "1000"))
+SUPABASE_BATCH_SIZE      = int(os.getenv("SUPABASE_BATCH_SIZE", "500"))
 STATE_SAVE_EVERY_RECORDS = int(os.getenv("STATE_SAVE_EVERY_RECORDS", "2000"))
 STATE_SAVE_EVERY_SECONDS = float(os.getenv("STATE_SAVE_EVERY_SECONDS", "10"))
 LOG_EVERY_RECORDS        = int(os.getenv("LOG_EVERY_RECORDS", "5000"))
 
 # Supabase retry settings
 SUPABASE_MAX_RETRIES = int(os.getenv("SUPABASE_MAX_RETRIES", "5"))
-SUPABASE_RETRY_BASE  = float(os.getenv("SUPABASE_RETRY_BASE", "2.0"))   # exponential base (seconds)
-SUPABASE_RETRY_MAX   = float(os.getenv("SUPABASE_RETRY_MAX", "60.0"))   # max wait between retries
+SUPABASE_RETRY_BASE  = float(os.getenv("SUPABASE_RETRY_BASE", "2.0"))
+SUPABASE_RETRY_MAX   = float(os.getenv("SUPABASE_RETRY_MAX", "60.0"))
 
 # Access DB connection retry
-DB_MAX_RETRIES   = int(os.getenv("DB_MAX_RETRIES", "3"))
-DB_RETRY_DELAY   = float(os.getenv("DB_RETRY_DELAY", "3.0"))
+DB_MAX_RETRIES = int(os.getenv("DB_MAX_RETRIES", "3"))
+DB_RETRY_DELAY = float(os.getenv("DB_RETRY_DELAY", "3.0"))
 
 # Persistent state files (crash recovery)
-user_home  = Path.home()
-documents  = user_home / "Documents"
-QUEUE_FILE = documents / "washing_machine_event_queue.json"
-STATE_FILE = documents / "washing_machine_collector_state.json"
-
-# Temp files for atomic writes
+user_home      = Path.home()
+documents      = user_home / "Documents"
+QUEUE_FILE     = documents / "washing_machine_event_queue.json"
+STATE_FILE     = documents / "washing_machine_collector_state.json"
 QUEUE_FILE_TMP = documents / "washing_machine_event_queue.json.tmp"
 STATE_FILE_TMP = documents / "washing_machine_collector_state.json.tmp"
 
@@ -84,7 +82,7 @@ def _mark_dirty():
 
 
 # ─────────────────────────────────────────────
-# STATE LOAD / SAVE  (atomic writes)
+# STATE LOAD / SAVE (atomic writes)
 # ─────────────────────────────────────────────
 def load_state():
     global last_timestamp, last_statuses, last_sent_statuses, open_events, event_queue
@@ -116,9 +114,7 @@ def load_state():
 
 
 def save_state():
-    """
-    Atomic save: write to .tmp then rename so a crash mid-write never corrupts the file.
-    """
+    """Atomic save: write to .tmp then rename so a crash mid-write never corrupts the file."""
     try:
         state_data = json.dumps({
             "last_timestamp":     last_timestamp.isoformat() if last_timestamp else None,
@@ -156,10 +152,6 @@ def maybe_save_state(force: bool = False):
 # DB HELPERS
 # ─────────────────────────────────────────────
 def get_connection():
-    """
-    Connect to Access DB with retry logic.
-    Retries up to DB_MAX_RETRIES times if the file is locked or temporarily unavailable.
-    """
     last_err = None
     for attempt in range(1, DB_MAX_RETRIES + 1):
         try:
@@ -177,18 +169,30 @@ def get_connection():
 
 def parse_timestamp(ts) -> datetime | None:
     """
-    Parse a timestamp from the Access DB.
-    The DB stores PKT local time with no timezone info (naive datetime).
-    e.g. '2026-03-03 16:00:00'  means  4:00 PM PKT.
-    We return the value as-is (still naive/PKT) — callers handle conversion.
+    Parse a timestamp from any of these sources:
+      - datetime object (pass-through)
+      - ISO 8601 string with T separator (from queue/state JSON): "2026-03-05T11:03:46"
+      - ISO 8601 with microseconds: "2026-03-05T11:03:46.123456"
+      - Access DB space-separated: "2026-03-05 11:03:46"
+      - Access DB 12-hour format:  "3/5/2026 11:03:46 AM"
     """
     if isinstance(ts, datetime):
         return ts
+
+    # fromisoformat handles all ISO variants: with T, with microseconds,
+    # with/without timezone — covers everything saved by .isoformat() in the queue
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        pass
+
+    # Fallback for Access DB formats not covered by fromisoformat
     for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %I:%M:%S %p"):
         try:
             return datetime.strptime(ts, fmt)
         except Exception:
             continue
+
     return None
 
 
@@ -201,31 +205,15 @@ def detect_status(power: bool, downtime: bool) -> str:
 
 
 def detect_shift(ts: datetime) -> str:
-    """
-    Determine the shift from a PKT-naive datetime (as read from Access DB).
-
-    The Access DB stores local PKT time directly, so ts.hour IS already the
-    PKT hour — no offset addition needed.
-
-    Shifts:
-      Morning : 07:00 – 14:59 PKT
-      Evening : 15:00 – 22:59 PKT
-      Night   : 23:00 – 06:59 PKT
-    """
-    pkt_hour = ts.hour
-    if 7 <= pkt_hour < 15:
+    h = ts.hour
+    if 7 <= h < 15:
         return "Morning"
-    if 15 <= pkt_hour < 23:
+    if 15 <= h < 23:
         return "Evening"
     return "Night"
 
 
 def to_utc_iso(ts: datetime) -> str:
-    """
-    Convert a PKT-naive datetime (from Access DB) to a UTC ISO-8601 string.
-    PKT = UTC+5, so we subtract 5 hours.
-    e.g.  datetime(2026,3,3,16,0,0)  →  '2026-03-03T11:00:00Z'
-    """
     utc_dt = ts - PKT_OFFSET
     return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -233,32 +221,42 @@ def to_utc_iso(ts: datetime) -> str:
 # ─────────────────────────────────────────────
 # SUPABASE HELPERS
 # ─────────────────────────────────────────────
-def supabase_insert_with_retry(table: str, rows: list) -> bool:
+
+def supabase_insert_events_with_retry(rows: list) -> bool:
     """
-    Insert rows into a Supabase table with exponential backoff retry.
-    Returns True on success, False if all retries exhausted.
+    Insert rows into machine_events via Postgres RPC using
+    INSERT ... ON CONFLICT DO NOTHING — safe for bulk inserts
+    with duplicates, compatible with supabase-py 2.28.0.
     """
+    if not rows:
+        return True
+
     for attempt in range(1, SUPABASE_MAX_RETRIES + 1):
         try:
-            supabase.table(table).insert(
-                rows, returning="minimal", count=None
+            supabase.rpc(
+                "insert_machine_events_ignore_duplicates",
+                {"events": rows}
             ).execute()
+
+            print(f"   ✔ Inserted batch of {len(rows)} rows via RPC")
             return True
+
         except Exception as e:
+            err_str = str(e)
+            print(f"🔍 RPC INSERT ERROR (attempt {attempt}/{SUPABASE_MAX_RETRIES}): {err_str}")
+
             wait = min(SUPABASE_RETRY_BASE ** attempt, SUPABASE_RETRY_MAX)
             if attempt < SUPABASE_MAX_RETRIES:
-                print(f"⚠️  Supabase insert ({table}) attempt {attempt}/{SUPABASE_MAX_RETRIES} failed: {e} — retrying in {wait:.1f}s")
+                print(f"⚠️  Retrying in {wait:.1f}s...")
                 time.sleep(wait)
             else:
-                print(f"❌ Supabase insert ({table}) failed after {SUPABASE_MAX_RETRIES} attempts: {e}")
+                print(f"❌ RPC insert failed after {SUPABASE_MAX_RETRIES} attempts.")
+
     return False
 
 
 def supabase_upsert_with_retry(table: str, rows: list, on_conflict: str) -> bool:
-    """
-    Upsert rows into a Supabase table with exponential backoff retry.
-    Returns True on success, False if all retries exhausted.
-    """
+    """Generic upsert helper used for live_status and other tables."""
     for attempt in range(1, SUPABASE_MAX_RETRIES + 1):
         try:
             supabase.table(table).upsert(rows, on_conflict=on_conflict).execute()
@@ -266,7 +264,8 @@ def supabase_upsert_with_retry(table: str, rows: list, on_conflict: str) -> bool
         except Exception as e:
             wait = min(SUPABASE_RETRY_BASE ** attempt, SUPABASE_RETRY_MAX)
             if attempt < SUPABASE_MAX_RETRIES:
-                print(f"⚠️  Supabase upsert ({table}) attempt {attempt}/{SUPABASE_MAX_RETRIES} failed: {e} — retrying in {wait:.1f}s")
+                print(f"⚠️  Supabase upsert ({table}) attempt {attempt}/{SUPABASE_MAX_RETRIES} "
+                      f"failed: {e} — retrying in {wait:.1f}s")
                 time.sleep(wait)
             else:
                 print(f"❌ Supabase upsert ({table}) failed after {SUPABASE_MAX_RETRIES} attempts: {e}")
@@ -274,10 +273,6 @@ def supabase_upsert_with_retry(table: str, rows: list, on_conflict: str) -> bool
 
 
 def check_supabase_connectivity():
-    """
-    Test Supabase connection on startup before doing any work.
-    Raises an exception if unreachable so we fail fast.
-    """
     try:
         supabase.table("live_status").select("machine_name").limit(1).execute()
         print("✅ Supabase connectivity check passed")
@@ -285,12 +280,58 @@ def check_supabase_connectivity():
         raise ConnectionError(f"❌ Supabase unreachable at startup: {e}")
 
 
+def test_insert_machine_events() -> bool:
+    """Test both direct insert AND the RPC function at startup."""
+    test_row = {
+        "machine_name":     "__test__",
+        "timestamp":        "2000-01-01T00:00:00Z",
+        "status":           "OFF",
+        "machine_power":    False,
+        "downtime":         False,
+        "shift":            "Night",
+        "duration_seconds": 0.0,
+    }
+
+    # 1. Test direct insert
+    try:
+        response = supabase.table("machine_events").insert(
+            test_row,
+            returning="representation",
+            count="exact",
+        ).execute()
+
+        inserted = response.count if response.count is not None else "unknown"
+        print(f"   → Direct insert count: {inserted}")
+        supabase.table("machine_events").delete().eq("machine_name", "__test__").execute()
+
+        if response.count != 1:
+            print(f"❌ Direct insert test failed: expected 1, got {inserted}")
+            return False
+
+        print("✅ Direct insert test PASSED")
+
+    except Exception as e:
+        print(f"❌ Direct insert test FAILED: {e}")
+        return False
+
+    # 2. Test RPC function
+    try:
+        response = supabase.rpc(
+            "insert_machine_events_ignore_duplicates",
+            {"events": [test_row]}
+        ).execute()
+        print(f"   → RPC response: {response}")
+        supabase.table("machine_events").delete().eq("machine_name", "__test__").execute()
+        print("✅ RPC insert test PASSED — function exists and is callable")
+        return True
+
+    except Exception as e:
+        print(f"❌ RPC insert test FAILED: {e}")
+        print("   → Run the CREATE FUNCTION SQL in Supabase SQL Editor first!")
+        return False
+
+
 def send_heartbeat():
-    """
-    Upsert a heartbeat row to collector_health table so the dashboard
-    can show whether the collector is alive or dead.
-    Schema: collector_health(id text PK, last_seen timestamptz, status text)
-    """
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         supabase.table("collector_health").upsert(
@@ -305,10 +346,6 @@ def send_heartbeat():
 # FETCH RECORDS FROM ACCESS DB
 # ─────────────────────────────────────────────
 def fetch_new_records(cursor, last_ts, batch_size: int = FETCH_BATCH_SIZE):
-    """
-    Streaming fetch from Access using fetchmany().
-    Yields lists of dict rows to avoid loading the whole table at once.
-    """
     try:
         if last_ts:
             cursor.execute(
@@ -341,13 +378,13 @@ def queue_event(event: dict):
 
 def flush_queue(batch_size: int = SUPABASE_BATCH_SIZE):
     """
-    Push queued events to Supabase machine_events table.
-    Uses retry logic — queue is only cleared after confirmed insert.
-    timestamp stored as UTC ISO; shift derived from PKT-naive ts.hour.
+    Push queued events to Supabase machine_events.
+    Queue is only cleared after a confirmed successful insert.
     """
     if not event_queue:
         return
 
+    print(f"🔄 flush_queue called — {len(event_queue)} events pending")
     flushed_total = 0
 
     while event_queue:
@@ -362,6 +399,7 @@ def flush_queue(batch_size: int = SUPABASE_BATCH_SIZE):
         for ev in batch:
             ts = parse_timestamp(ev.get("timestamp"))
             if not ts:
+                print(f"⚠️  Could not parse timestamp: {ev.get('timestamp')!r} — skipping event")
                 continue
             rows_to_insert.append({
                 "machine_name":     ev["machine"],
@@ -374,79 +412,70 @@ def flush_queue(batch_size: int = SUPABASE_BATCH_SIZE):
             })
 
         if not rows_to_insert:
+            # Every event in this batch had an unparseable timestamp — log and discard
+            print(f"⚠️  Entire batch of {len(batch)} events had unparseable timestamps — discarding.")
+            print(f"   Sample event: {batch[0] if batch else 'empty'}")
             del event_queue[:batch_size]
             _mark_dirty()
             maybe_save_state(force=True)
             continue
 
-        print(f"⬆️  Inserting {len(rows_to_insert)} machine_events "
-              f"(queue remaining: {max(len(event_queue) - len(batch), 0)})")
+        print(f"⬆️  Inserting {len(rows_to_insert)} rows "
+              f"(queue remaining after: {max(len(event_queue) - len(batch), 0)})")
 
-        success = supabase_insert_with_retry("machine_events", rows_to_insert)
+        success = supabase_insert_events_with_retry(rows_to_insert)
         if success:
             del event_queue[:batch_size]
             flushed_total += len(rows_to_insert)
             _mark_dirty()
             maybe_save_state(force=True)
         else:
-            print(f"⚠️  Flush paused — {len(event_queue)} events remain in queue (saved to disk)")
+            print(f"⚠️  Flush paused — {len(event_queue)} events remain (saved to disk)")
             maybe_save_state(force=True)
             break
 
     if flushed_total:
-        print(f"✅ Flushed {flushed_total} events to Supabase")
+        print(f"✅ Flushed {flushed_total} events to Supabase machine_events")
 
 
 # ─────────────────────────────────────────────
 # LIVE STATUS
 # ─────────────────────────────────────────────
 def update_live_statuses(record: dict, ts: datetime):
-    """
-    Upsert current machine states into live_status table.
-    updated_at is stored as UTC ISO. Also includes current shift.
-    Supabase Realtime pushes changes to all subscribed React clients.
-    """
     current_statuses = {}
 
     for key, val in record.items():
         if not key.lower().endswith("power"):
             continue
-
-        machine = key.replace("_Power", "").replace("Power", "")
-        power   = bool(val)
-
+        machine  = key.replace("_Power", "").replace("Power", "")
+        power    = bool(val)
         downtime = False
-        for dk in (
-            f"{machine}_DownTime", f"{machine}_Downtime",
-            f"{machine}DownTime",  f"{machine}Downtime",
-        ):
+        for dk in (f"{machine}_DownTime", f"{machine}_Downtime",
+                   f"{machine}DownTime",  f"{machine}Downtime"):
             if dk in record:
                 downtime = bool(record[dk])
                 break
-
         current_statuses[machine] = detect_status(power, downtime)
 
-    # Skip if nothing changed
     if current_statuses == last_sent_statuses:
         return
 
     rows_to_upsert = [
         {
-            "machine_name": machine,
-            "status":       status,
-            "shift":        detect_shift(ts),   # ← shift now included
+            "machine_name": m,
+            "status":       s,
+            "shift":        detect_shift(ts),
             "updated_at":   to_utc_iso(ts),
         }
-        for machine, status in current_statuses.items()
+        for m, s in current_statuses.items()
     ]
-
     if not rows_to_upsert:
         return
 
-    total = 0
+    total  = 0
     all_ok = True
     for i in range(0, len(rows_to_upsert), SUPABASE_BATCH_SIZE):
-        chunk = rows_to_upsert[i : i + SUPABASE_BATCH_SIZE]
+        chunk = rows_to_upsert[i: i + SUPABASE_BATCH_SIZE]
         ok = supabase_upsert_with_retry("live_status", chunk, on_conflict="machine_name")
         if ok:
             total += len(chunk)
@@ -467,8 +496,7 @@ def update_live_statuses(record: dict, ts: datetime):
 # PROCESS RECORDS
 # ─────────────────────────────────────────────
 def process_records(records: list, total_processed_so_far: int = 0) -> int:
-    global last_timestamp
-    global _records_since_save
+    global last_timestamp, _records_since_save
 
     processed      = 0
     status_changes = 0
@@ -488,27 +516,22 @@ def process_records(records: list, total_processed_so_far: int = 0) -> int:
             if not key.lower().endswith("power"):
                 continue
 
-            machine = key.replace("_Power", "").replace("Power", "")
-            power   = bool(val)
-
+            machine  = key.replace("_Power", "").replace("Power", "")
+            power    = bool(val)
             downtime = False
-            for dk in (
-                f"{machine}_DownTime", f"{machine}_Downtime",
-                f"{machine}DownTime",  f"{machine}Downtime",
-            ):
+            for dk in (f"{machine}_DownTime", f"{machine}_Downtime",
+                       f"{machine}DownTime",  f"{machine}Downtime"):
                 if dk in rec:
                     downtime = bool(rec[dk])
                     break
 
             status      = detect_status(power, downtime)
             prev_status = last_statuses.get(machine)
-
             if status == prev_status:
                 continue
 
             status_changes += 1
 
-            # Close the previous open event — compute its duration
             if machine in open_events:
                 prev    = open_events[machine]
                 prev_ts = datetime.fromisoformat(prev["timestamp"])
@@ -516,9 +539,6 @@ def process_records(records: list, total_processed_so_far: int = 0) -> int:
                 queue_event(prev)
                 events_queued += 1
 
-            # Open a new event.
-            # Store timestamp as PKT-naive isoformat so detect_shift works correctly
-            # in flush_queue (ts.hour = PKT hour, no offset math needed).
             open_events[machine] = {
                 "timestamp":       ts.isoformat(),
                 "machine":         machine,
@@ -530,15 +550,16 @@ def process_records(records: list, total_processed_so_far: int = 0) -> int:
             last_statuses[machine] = status
             _mark_dirty()
 
-        last_timestamp = ts
-        processed      += 1
+        last_timestamp      = ts
+        processed           += 1
         _records_since_save += 1
 
         if processed % LOG_EVERY_RECORDS == 0:
             print(
                 f"⏳ Processed {total_processed_so_far + processed:,} records "
-                f"(batch {processed:,}); status changes: {status_changes:,}; "
-                f"events queued: {events_queued:,}; queue size: {len(event_queue):,}"
+                f"| status changes: {status_changes:,} "
+                f"| events queued: {events_queued:,} "
+                f"| queue size: {len(event_queue):,}"
             )
 
         maybe_save_state()
@@ -552,33 +573,29 @@ def process_records(records: list, total_processed_so_far: int = 0) -> int:
 # ─────────────────────────────────────────────
 def main():
     print("🚀 Collector running → Supabase (events + live statuses)")
-    print(f"   Supabase URL : {SUPABASE_URL}")
-    print(f"   Poll interval: {POLL_INTERVAL}s")
-    print(f"   DB path      : {DB_PATH}")
-    print()
-    print("   Timezone contract:")
-    print("   • Access DB  → PKT naive (no tz info)")
-    print("   • detect_shift uses ts.hour directly (already PKT)")
-    print("   • to_utc_iso subtracts 5h → real UTC stored in Supabase")
-    print("   • Frontend adds 5h back for display → shows correct PKT")
+    print(f"   Supabase URL  : {SUPABASE_URL}")
+    print(f"   Poll interval : {POLL_INTERVAL}s")
+    print(f"   DB path       : {DB_PATH}")
+    print(f"   Batch size    : {SUPABASE_BATCH_SIZE} rows/insert")
     print()
 
-    # ── Startup checks ──────────────────────────────────────────────────────
     if DB_PATH and not Path(DB_PATH).exists():
         print(f"❌ DB_PATH does not exist: {DB_PATH}")
-        print("   Fix your .env DB_PATH and restart.")
         return
 
     try:
         check_supabase_connectivity()
     except ConnectionError as e:
         print(e)
-        print("   Fix your SUPABASE_URL / SUPABASE_SERVICE_KEY and restart.")
+        return
+
+    print("🔬 Running startup insert test...")
+    if not test_insert_machine_events():
+        print("🛑 Aborting — fix the errors above, then restart.")
         return
 
     load_state()
 
-    # Flush anything left in queue from a previous crashed run
     if event_queue:
         print(f"🔄 Flushing {len(event_queue)} recovered events from previous run...")
         flush_queue()
@@ -614,14 +631,12 @@ def main():
                 processed = process_records(batch, total_processed_so_far=total_processed)
                 total_processed += processed
 
-                # Flush periodically during large backfills
                 if len(event_queue) >= SUPABASE_BATCH_SIZE:
                     flush_queue()
 
             if not any_batches:
                 print("ℹ️  No new rows found in TREND001.")
 
-            # Push live status snapshot from the latest row we saw
             if last_batch_latest is not None:
                 ts = parse_timestamp(last_batch_latest.get("Time_Stamp"))
                 if ts:
@@ -632,11 +647,8 @@ def main():
             cursor.close()
             conn.close()
             maybe_save_state(force=True)
-
-            # ── Heartbeat ────────────────────────────────────────────────────
             send_heartbeat()
 
-            # ── Per-cycle summary ────────────────────────────────────────────
             elapsed = time.monotonic() - cycle_start
             print(
                 f"✔  Cycle {cycle} done in {elapsed:.1f}s — "
@@ -660,7 +672,6 @@ def main():
             if not _shutdown_requested:
                 time.sleep(5)
 
-    # ── Clean shutdown ───────────────────────────────────────────────────────
     print("💾 Saving state before exit...")
     maybe_save_state(force=True)
 
@@ -668,7 +679,6 @@ def main():
         print(f"⬆️  Flushing {len(event_queue)} remaining events before exit...")
         flush_queue()
 
-    # Mark collector as offline in Supabase
     try:
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         supabase.table("collector_health").upsert(
@@ -681,6 +691,5 @@ def main():
     print("👋 Collector shut down cleanly.")
 
 
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
     main()
