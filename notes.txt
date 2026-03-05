@@ -55,3 +55,8 @@ SQL >
 
 When you’re done working and want to deactivate it, just type:
         deactivate
+
+
+Supabase install:
+
+ python -m pip install supabase
